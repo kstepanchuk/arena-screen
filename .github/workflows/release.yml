@@ -1,0 +1,111 @@
+# Publishes an update: push a tag like v1.2.0 and every installed plugin (Windows and Mac) will find it.
+#
+#   git tag -a v1.2.0 -m "Arreglado el recorte en pantallas 4K"
+#   git push origin v1.2.0
+#
+# The tag message becomes the notes shown in the update window.
+name: Release
+
+on:
+  push:
+    tags: ['v*.*.*']
+
+permissions:
+  contents: write
+
+env:
+  MANIFEST_URL: https://github.com/${{ github.repository }}/releases/latest/download/latest.json
+
+jobs:
+  windows:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        shell: bash
+        run: >
+          cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+          "-DPLUGIN_VERSION=${GITHUB_REF_NAME#v}"
+          "-DUPDATE_MANIFEST_URL=${MANIFEST_URL}"
+
+      - name: Build
+        run: cmake --build build --config Release
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: |
+            build/Release/ScreenCapture.dll
+
+  mac:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: >
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          "-DPLUGIN_VERSION=${GITHUB_REF_NAME#v}"
+          "-DUPDATE_MANIFEST_URL=${MANIFEST_URL}"
+
+      - name: Build
+        run: cmake --build build -j 4
+
+      - name: Sign bundles (ad-hoc) and zip
+        run: |
+          for bundle in ScreenCapture ScreenCaptureArena6; do
+            codesign --force --deep --sign - "build/$bundle.bundle"
+            codesign --verify --strict "build/$bundle.bundle"
+          done
+          ditto -c -k --keepParent build/ScreenCapture.bundle ScreenCapture-mac.zip
+          ditto -c -k --keepParent build/ScreenCaptureArena6.bundle ScreenCapture-mac-arena6.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mac
+          path: |
+            ScreenCapture-mac.zip
+            ScreenCapture-mac-arena6.zip
+
+  publish:
+    needs: [windows, mac]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Write update manifest
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          git fetch --force origin "refs/tags/${tag}:refs/tags/${tag}"
+          notes="$(git tag -l --format='%(contents)' "$tag" | sed -e 's/[[:space:]]*$//')"
+          [ -n "$notes" ] || notes="$(git log -1 --format=%s)"
+          printf '%s\n' "$notes" > notes.txt
+          base="https://github.com/${GITHUB_REPOSITORY}/releases/download/${tag}"
+          jq -n \
+            --arg version "${tag#v}" \
+            --arg url "$base/ScreenCapture.dll" \
+            --arg sha256 "$(sha256sum dist/ScreenCapture.dll | cut -d' ' -f1)" \
+            --arg url_mac "$base/ScreenCapture-mac.zip" \
+            --arg sha256_mac "$(sha256sum dist/ScreenCapture-mac.zip | cut -d' ' -f1)" \
+            --arg url_mac_arena6 "$base/ScreenCapture-mac-arena6.zip" \
+            --arg sha256_mac_arena6 "$(sha256sum dist/ScreenCapture-mac-arena6.zip | cut -d' ' -f1)" \
+            --arg notes "$notes" \
+            '{version: $version, url: $url, sha256: $sha256, url_mac: $url_mac, sha256_mac: $sha256_mac, url_mac_arena6: $url_mac_arena6, sha256_mac_arena6: $sha256_mac_arena6, notes: $notes}' > latest.json
+          cat latest.json
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >
+          gh release create "$GITHUB_REF_NAME"
+          dist/ScreenCapture.dll dist/ScreenCapture-mac.zip dist/ScreenCapture-mac-arena6.zip
+          latest.json
+          --title "$GITHUB_REF_NAME" --notes-file notes.txt

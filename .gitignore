@@ -1,0 +1,5 @@
+build/
+build-mac/
+.vs/
+*.user
+.DS_Store
